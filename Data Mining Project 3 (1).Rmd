@@ -1,0 +1,687 @@
+---
+title: "Data Mining HW3"
+author: "Zeyu Yang, Blake Robert Mills"
+date: "4/19/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+#Libraries
+```{r echo=FALSE, warning=FALSE}
+library(readxl)
+library(plyr)
+library(dplyr)
+library(SnowballC)
+library(tm)
+library(zoo)
+library(tidyr)
+library(caTools)
+library(readr)
+library(rpart)
+library(randomForest)
+```
+
+#Functions
+```{r}
+simpleCap <- function(x) {
+  s <- tolower(x)
+  s <- strsplit(s, " ")[[1]]
+  paste(toupper(substring(s, 1,1)), substring(s, 2),
+        sep="", collapse=" ")
+}
+```
+
+
+#Files
+```{r echo=FALSE, warning=FALSE}
+Invests <- read_xlsx("~/Downloads/Data Mining Project 3.xlsx")
+Verticals <- read_xlsx("~/Downloads/Data Mining Project 3 Verticals.xlsx")
+CityCounty <- read_xlsx("~/Downloads/CityCounty Data Mining.xlsx")
+```
+
+## Cleaning
+```{r}
+#Gets rid of non-confirmed Covid cases in investigations
+Invests <- Invests %>% filter(case_status %in% c("Confirmed", "Probable"))
+
+#Death and Hospitalization dummy variable 
+Invests$DeathDummy <- ifelse(Invests$die_from_illness_ind!="Y" | 
+                             is.na(Invests$die_from_illness_ind)==TRUE , 0, 1)
+Invests$HospDummy <- ifelse(Invests$hsptlizd_ind!="Y" | 
+                             is.na(Invests$hsptlizd_ind)==TRUE , 0, 1)
+
+#Removes People not in the Jurisdiction
+Verticals <- merge(Verticals, CityCounty, by.x="patient_city", by.y="City")
+Verticals$specimen_collection_dt <- as.Date(Verticals$specimen_collection_dt, "%Y-%m-%d",tz="America/New_York")
+Verticals <- subset(Verticals, NewCounty != "Missing" & specimen_collection_dt < "2021-05-01" &
+                      specimen_collection_dt >= "2020-03-01")
+
+#Cleaning Demographic Variables
+Invests$AgeNum <- as.numeric(Invests$age_calc)
+
+#City Cleaning
+Invests$CityClean <- removePunctuation(Invests$patient_city)
+Invests$CityClean <- sapply(Invests$CityClean, simpleCap)
+Invests <- left_join(Invests, CityCounty, by=c("CityClean" = "City"))
+
+#Removes People out of the jurisdiction
+Invests$NewCounty <- ifelse(is.na(Invests$NewCity)==TRUE, "Missing", Invests$NewCounty)
+Invests <- subset(Invests, NewCounty != "Missing")
+
+#Gender Cleaning
+Invests$NewGender <- ifelse(Invests$patient_current_sex=="U", NA, Invests$patient_current_sex)
+
+#Cleans Race Variable
+Invests$NewRace <- revalue(Invests$patient_race_calc, c("American Indian or Alaska Native; White" = "American Indian or Alaska Native",
+                                              "Asian; Black or African American" = "Asian",
+                                              "Asian; unknown" = "Asian",
+                                              "Asian; White" = "Asian",
+                                              "Black or African American; Native Hawaiian or Other Pacific Islander" = "Black or African American",
+                                              "Black or African American; unknown" = "Black or African American",
+                                              "Black or African American; White" = "Black or African American",
+                                              "Black or African American; White; unknown" = "Black or African American",
+                                              "Native Hawaiian or Other Pacific Islander; White" = "Native Hawaiian or Other Pacific Islander",
+                                              "not asked" = NA,
+                                              "Refused to answer" = NA,
+                                              "unknown" = NA,
+                                              "White; unknown" = "White",
+                                              "White; Other Race" = "White"))
+Invests$NewRace <- ifelse(is.na(Invests$NewRace)==TRUE, "Unknown", Invests$NewRace)
+
+#Relevels Ethnicity 
+Invests$ethnicity <- as.factor(Invests$ethnicity)
+Invests$ethnicity <- relevel(Invests$ethnicity, ref = "Not Hispanic or Latino")
+Invests$ethnicity <- ifelse(is.na(Invests$ethnicity)==TRUE, "Unknown", Invests$ethnicity)
+
+#Days Sick
+Invests$illness_duration <- as.numeric(Invests$illness_duration)
+Invests$IllnessLength <- as.Date(Invests$illness_end_dt) - as.Date(Invests$illness_onset_dt)
+Invests$IllnessLength <- ifelse(Invests$symptomatic =="No", 0, Invests$IllnessLength)
+
+```
+
+## Symptom Collapsing
+```{r}
+#Gastrointestinal Symptoms
+Invests$GISymp <- ifelse(Invests$diarrhea == "Yes" |
+                         Invests$abdominal_pain == "Yes", 
+                         1, 0)
+
+#Ear, Nose, and Throat Symptoms
+Invests$ENTSymp <- ifelse(Invests$coryza_runny_nose_ind == "Yes" |
+                         Invests$loss_smell_covid == "Yes" | 
+                         Invests$loss_taste_smell == "Yes" |
+                         Invests$sore_throat_ind == "Yes", 
+                         1, 0)
+#Respiratory Symptoms
+Invests$RespSymp <- ifelse(Invests$cough_ind == "Yes" |
+                         Invests$dyspnea_ind == "Yes" | 
+                         Invests$wheezing_ind == "Yes", 
+                         1, 0)
+
+#Systemic Symptoms
+Invests$SysSymp <- ifelse(Invests$fatigue_malaise == "Yes" |
+                         Invests$fever == "Yes" | 
+                         Invests$feverish_ind == "Yes" |
+                         Invests$headache == "Yes" | 
+                         Invests$loss_of_appetite_ind == "Yes" | 
+                         Invests$nausea == "Yes",  
+                         1, 0)
+
+#Muscular-Skeletal Symptoms
+Invests$MuscSymp <- ifelse(Invests$chills_rigors == "Yes" |
+                         Invests$myalgia == "Yes" | 
+                         Invests$rigors_ind == "Yes", 
+                         1, 0)
+
+#Accounts for Asymptomatics 
+Invests$GISymp <- ifelse(is.na(Invests$GISymp)== TRUE &
+                         Invests$symptomatic=="No",
+                         0, Invests$GISymp)
+
+Invests$ENTSymp <- ifelse(is.na(Invests$ENTSymp)== TRUE &
+                         Invests$symptomatic=="No",
+                         0, Invests$ENTSymp)
+
+Invests$RespSymp <- ifelse(is.na(Invests$RespSymp)== TRUE &
+                         Invests$symptomatic=="No",
+                         0, Invests$RespSymp)
+
+Invests$SysSymp <- ifelse(is.na(Invests$SysSymp)== TRUE &
+                         Invests$symptomatic=="No",
+                         0, Invests$SysSymp)
+
+Invests$MuscSymp <- ifelse(is.na(Invests$MuscSymp)== TRUE &
+                         Invests$symptomatic=="No",
+                         0, Invests$MuscSymp)
+
+
+```
+
+## Pre-existing Conditions Cleaning
+```{r}
+#Liver Conditions
+Invests$LiverCond <- ifelse(Invests$chronic_liver_dis_ind == "Yes", 1, 0)
+Invests$LiverCond <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$LiverCond)
+
+#Lung Conditions
+Invests$LungCond <- ifelse(Invests$chronic_lung_dis_ind == "Yes", 1, 0)
+Invests$LungCond <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$LungCond)
+
+#Renal (Kidney) Conditions
+Invests$RenalCond <- ifelse(Invests$chronic_renal_dis_ind == "Yes", 1, 0)
+Invests$RenalCond <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$RenalCond)
+
+#Cardiovascular Conditions
+Invests$CVCond <- ifelse(Invests$cv_disease_ind == "Yes", 1, 0)
+Invests$CVCond <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$CVCond)
+
+#Autoimmune Conditions
+Invests$ImmunoCond <- ifelse(Invests$immuno_condition_ind == "Yes", 1, 0)
+Invests$ImmunoCond <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$ImmunoCond)
+
+#Diabetes 
+Invests$Diab <- ifelse(Invests$diabetes_mellitus_ind == "Yes", 1, 0)
+Invests$Diab <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$Diab)
+
+#Neurological or Psychiatric Conditions
+Invests$NeuroCond <- ifelse(Invests$NEURO_DISABLITY_IND == "Yes" |
+                            Invests$psychiatric_condition == "Yes",
+                            1, 0)
+Invests$NeuroCond <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$NeuroCond)
+
+#Substance Abuse 
+Invests$SubAbuse <- ifelse(Invests$substance_abuse == "Yes", 1, 0)
+Invests$SubAbuse <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$SubAbuse)
+
+#Smoker
+Invests$Smoker <- ifelse(Invests$current_smoker_ind == "Yes", 1, 0)
+Invests$Smoker <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$Smoker)
+
+#Obesity
+Invests$Obese <- ifelse(Invests$obesity_ind == "Yes", 1, 0)
+Invests$Obese <- ifelse(Invests$preexisting_cond_ind == "No", 0, Invests$Obese)
+
+#Pneumonia
+Invests$Pneum <- ifelse(Invests$pneumonia == "Yes", 1, 0)
+```
+
+
+
+
+## Random Forest
+```{r echo=FALSE, warning=FALSE}
+#Random Forest already loaded
+load("~/Downloads/Forest.RData")
+
+#Creates a Minor Dummy Variable
+Invests$MinorYN <- ifelse(Invests$age_calc < 19, "Minor", "")
+
+#Cleans the missing and NA values of Industry, Occupation, and Employer
+Invests$industry <- replace_na(Invests$industry, "Missing")
+Invests$occupation <- replace_na(Invests$occupation, "Missing")
+Invests$employer <- replace_na(Invests$employer, "Missing")
+Invests$industry <- revalue(Invests$industry, c("N/a"="Missing"))
+Invests$employer <- revalue(Invests$employer, c("N/a"="Missing", "NANA"="Missing", "NA"= "Missing"))
+Invests$occupation <- revalue(Invests$occupation, c("N/a"="Missing","NANA"="Missing", "NA"= "Missing"))
+
+#Creates a new columns for the forest
+Invests$Corpus <- paste(Invests$industry, Invests$occupation, Invests$employer, Invests$MinorYN, sep=" ")
+
+#Cleaning of new corpus
+Invests$Corpus <- gsub("/", " ",Invests$Corpus)
+NewCorp <- VCorpus(VectorSource(Invests$Corpus))
+NewCorp <- tm_map(NewCorp, removePunctuation)
+NewCorp <- tm_map(NewCorp, content_transformer(tolower))
+
+#Runs the forest
+freq <- DocumentTermMatrix(NewCorp)
+CovidIndustry <- as.data.frame(as.matrix(freq))
+colnames(CovidIndustry) <- make.names(colnames(CovidIndustry))
+Invests$NewIndustry <- predict(IndForest, newdata=CovidIndustry, type="class")
+rm(CovidIndustry, NewCorp, freq, IndForest)
+
+```
+
+
+#Verticals Sickness in the Last 3 days
+```{r}
+VerticalPos <- vector()
+
+
+for(i in unique(Verticals$NewCity)){
+  NewV <- Verticals %>% filter(Lab_Status=="Positive", NewCity== i) %>% dplyr::count(specimen_collection_dt)
+  NewV <- NewV %>% complete(specimen_collection_dt  = seq.Date(min(na.omit(Verticals$specimen_collection_dt)),
+                                                      max(na.omit(Verticals$specimen_collection_dt)),
+                                                      by="day"))
+  NewV$n <- replace_na(NewV$n, 0)
+  NewV$Last3Days <- rollsum(NewV$n, align="right", k=3, fill=NA)
+  NewV$Sick14Days <- rollsum(NewV$n, align="right", k=14, fill=NA)
+  NewV$City <- i
+  NewV <- subset(NewV, specimen_collection_dt >= "2020-03-16")
+  VerticalPos <- rbind(VerticalPos, NewV)
+}
+
+VerticalPos <- left_join(VerticalPos, CityCounty, by= "City")
+VerticalPos$PercentSick14 <- VerticalPos$Sick14Days/VerticalPos$CityPopulation
+rm(NewV)
+
+Invests$first_pos_test <- as.Date(Invests$first_pos_test, "%Y-%m-%d")
+Invests <- left_join(Invests, VerticalPos, by=c("NewCity", "first_pos_test"="specimen_collection_dt"))
+```
+
+
+```{r}
+#Keeps the relevant variables
+InvestsComplete <- Invests %>% dplyr::select(IllnessLength, HospDummy, DeathDummy, GISymp, ENTSymp, RespSymp, SysSymp,
+                               MuscSymp, LiverCond, LungCond, RenalCond, CVCond, ImmunoCond, Diab,
+                               NeuroCond, Smoker, SubAbuse, Obese, Pneum, AgeNum, ethnicity,
+                               NewIndustry, NewRace, NewGender, PercentSick14, NewCounty.y)
+
+#gets rid of totally incomplete cases and fills the preexisting and sypmtoms
+InvestsComplete <- subset(InvestsComplete, rowSums(is.na(InvestsComplete[ , 3:19])) < 16)
+InvestsComplete[ , 3:19] <- InvestsComplete[ , 3:19] %>% na.fill(0)
+
+```
+
+
+### Deathmodel
+```{r echo=FALSE, warning=FALSE}
+
+############################################ data cleaning ############################################
+## factorized catagorical variable
+InvestsComplete[2:19] <- apply(InvestsComplete[2:19],2, as.factor)
+## scale the age variable used
+InvestsComplete$AgeNum <- scale(InvestsComplete$AgeNum)
+
+## missing value in percentsick probability no city data
+## remove those observations
+sum(is.na(InvestsComplete$PercentSick14))
+InvestsComplete <- InvestsComplete[-which(is.na(InvestsComplete$PercentSick14) == TRUE),]
+
+
+## Dummy variable for NewIndustries
+library(fastDummies)
+InvestsComplete <- dummy_cols(InvestsComplete, select_columns = c("NewIndustry","NewCounty.y"))
+
+NewIndustry_names <- names(InvestsComplete)[grep("NewIndustry",names(InvestsComplete))]
+NewIndustry_names <- NewIndustry_names[-1]
+NewIndustry_names <- paste0((NewIndustry_names), collapse  = "`+`") 
+NewIndustry_names <- paste("`",NewIndustry_names,"`")
+
+
+
+############################################ models ############################################
+DeathModel <- glm(as.factor(DeathDummy) ~ 
+             #Symptoms
+             #NewIndustry + 
+               GISymp + ENTSymp + RespSymp + SysSymp + MuscSymp  +
+             
+             #Pre-Existing
+             LiverCond + LungCond + RenalCond + CVCond + ImmunoCond + Diab + NeuroCond +
+             Smoker + SubAbuse + Obese +
+              
+             #After Effects
+             Pneum + 
+                          
+             #Demographics
+             AgeNum + PercentSick14
+             
+             # Industries patient work in
+             
+             + `NewIndustry_Agriculture or Animal Husbandry`+`NewIndustry_Construction and Real Estate`+`NewIndustry_Disabled, Retired, or Unemployed`+`NewIndustry_Disabled/Retired/Unemployed`+`NewIndustry_Educational Services`+`NewIndustry_Food or Lodging Services`+`NewIndustry_Food Production (Meat/Poultry)`+`NewIndustry_Healthcare Services`+`NewIndustry_Manufacturing or Heavy Industry`+`NewIndustry_Minor or Student`+`NewIndustry_Missing or did not want to disclose`+`NewIndustry_Professional Services`+`NewIndustry_Public Sector`+`NewIndustry_Retail`+`NewIndustry_Self-employed`+`NewIndustry_Social Assistance Services`+`NewIndustry_Transportation and Automotive Services`+`NewIndustry_Utilities`,   
+               
+               
+             data = InvestsComplete, family = "binomial")
+summary(DeathModel)
+
+
+library(MASS)
+step.DeathModel <- DeathModel %>% stepAIC(trace = FALSE) 
+summary(step.DeathModel)
+
+# collinerity check
+## the VIF is relatively low with around 1-2 for all variable selected
+Death_VIF <- car::vif((step.DeathModel))
+Death_VIF <- Death_VIF[which(Death_VIF<10)]
+
+
+### with cross validation to choose variables
+
+library(glmnet)
+library(caret)
+
+set.seed(1231)
+k = 5
+test_folds <- createFolds(t(InvestsComplete[,2]), k = 5, list = FALSE)
+Metrics = matrix(NA,nrow = 5, ncol = 3)
+colnames(Metrics) <- c("Recall", "Precision", "cutoff")
+
+
+Dmodel_coef_list <- list() 
+Logit_out <- list()
+for(i in seq_len(k)){
+
+    #code that isolates the test/train data!
+    is_test = test_folds == i
+    is_train = !is_test
+    # fitting models and counting time
+    print(paste("cross validation fold", i))
+    t0 <- Sys.time()
+    DeathModel2 <- glm(as.factor(DeathDummy) ~ 
+             #Symptoms
+             #NewIndustry + 
+               GISymp + RespSymp + SysSymp + MuscSymp  +
+             
+             #Pre-Existing
+             RenalCond + CVCond + NeuroCond + Obese +
+              
+             #After Effects
+             Pneum + 
+               
+             # industries
+             `NewIndustry_Healthcare Services` + NewIndustry_Retail + 
+             `NewIndustry_Missing or did not want to disclose` +
+                          
+             #Demographics
+             AgeNum + PercentSick14,
+  
+             data = InvestsComplete[is_train,], family = "binomial")
+    
+    
+    #print(paste('running Logit regression took', Sys.time() - t0))
+    # prediction metirc 
+    #test_pred = predict(DeathModel2, newdata = InvestsComplete[is_test,])
+    Dmodel_coef <- coef(DeathModel2)[which(summary(DeathModel2)$coefficients[,4]<0.05)]
+    
+    ## subset x with coeficient significant
+    coef_name <- stringr::str_remove(names(Dmodel_coef)[-1],"1")
+    coef_name <- stringr::str_remove_all(coef_name,"`")
+    pos <- match(names(InvestsComplete),coef_name)
+    x <- InvestsComplete[,which(!is.na(pos) == TRUE)]
+    print(paste("variables used in model:",NLP::as.String(names(x))))
+
+    x <- x[is_test,]
+    Actual <- InvestsComplete[is_test,"DeathDummy"]
+    Actual <- apply(Actual,2,as.numeric)
+    Y <- Dmodel_coef[1]+ apply(x,2,as.numeric) %*% Dmodel_coef[2:length(Dmodel_coef)]
+    p_hat <- exp(Y)/(1+exp(Y))
+    Logit_out[[i]] <- p_hat
+    ## we want recall higher than 0.8 so we have 80% of the death recognized
+    
+    Rec <- c()
+    Prec <- c()
+    for (j in seq(1,1000,by = 1)){
+      cutoff <- 1 - 0.001*j
+      Rec[j] <- ModelMetrics::recall(Actual, p_hat, cutoff = cutoff)
+      Prec[j] <- ModelMetrics::precision(Actual, p_hat, cutoff = cutoff)
+    }
+    ## Maximize Precision with higher than 0.8 recall
+    
+    Best_prec <- max(Prec[which(Rec>= 0.8)])
+    Best_score_ind <- Position(function(x) x == Best_prec, Prec)
+    cutoff <- 1 - 0.001*Best_score_ind
+    Metrics[i,1] <- Rec[Best_score_ind]
+    Metrics[i,2] <- Prec[Best_score_ind]
+    Metrics[i,3] <- cutoff
+
+    print(paste("Probability higher than ", round(cutoff,4), " is consider dead"))
+    print(paste("Recall :", Rec[Best_score_ind]))
+    print(paste("Precision :", Prec[Best_score_ind]))
+
+}
+
+## best was from cross validation fold 1:
+## "variables used in model:
+## RespSymp\nSysSymp\nMuscSymp\nRenalCond\nCVCond\nNeuroCond\nPneum\nAgeNum\nNewIndustry_Missing or did not want to disclose"
+
+final_DeathModel <- glm(as.factor(DeathDummy) ~ 
+             #Symptoms
+             #NewIndustry + 
+             RespSymp + MuscSymp + SysSymp +
+             
+             #Pre-Existing
+             RenalCond + CVCond + NeuroCond +
+              
+             #After Effects
+             Pneum + `NewIndustry_Missing or did not want to disclose` +
+                          
+             #Demographics
+             AgeNum,
+  
+             data = InvestsComplete, family = "binomial")
+summary(final_DeathModel)
+
+Dmodel_coef <- coef(final_DeathModel)
+
+coef_name <- stringr::str_remove(names(Dmodel_coef)[-1],"1")
+coef_name <- stringr::str_remove_all(coef_name,"`")
+pos <- match(names(InvestsComplete),coef_name)
+Death_x <- InvestsComplete[,which(!is.na(pos) == TRUE)]
+
+Actual <- InvestsComplete[,"DeathDummy"]
+Actual <- apply(Actual,2,as.numeric)
+Death_Y <- coef(final_DeathModel)[1]+ apply(Death_x,2,as.numeric) %*% coef(final_DeathModel)[2:length(coef(final_DeathModel))]
+Death_p_hat <- exp(Death_Y)/(1+exp(Death_Y))
+
+
+## cutoff
+    Rec <- c()
+    Prec <- c()
+    for (j in seq(1,1000,by = 1)){
+      cutoff <- 1 - 0.001*j
+      Rec[j] <- ModelMetrics::recall(Actual, Death_p_hat, cutoff = cutoff)
+      Prec[j] <- ModelMetrics::precision(Actual, Death_p_hat, cutoff = cutoff)
+    }
+    ## Maximize Precision with higher than 0.8 recall
+    
+    Best_prec <- max(Prec[which(Rec>= 0.8)])
+    Best_score_ind <- Position(function(x) x == Best_prec, Prec)
+    cutoff <- 1 - 0.001*Best_score_ind
+
+Dmodel_metric <- c()
+Dmodel_metric["recall"] <- ModelMetrics::recall(Actual, Death_p_hat, cutoff = cutoff)
+Dmodel_metric["precision"] <-ModelMetrics::precision(Actual, Death_p_hat, cutoff = cutoff)
+Dmodel_metric["cutoff"] <- cutoff
+
+Dmodel_metric
+plot(Death_p_hat, main = "Death regression", ylab = "death probability")
+
+
+
+```
+
+
+
+
+### Hospitalization Model
+```{r }
+
+#Hospitalization Regression
+HospModel <- glm(as.factor(HospDummy) ~ 
+             #Symptoms
+              GISymp + ENTSymp + RespSymp + SysSymp + MuscSymp  + 
+             
+             #Pre-Existing
+             LiverCond + LungCond + RenalCond + CVCond + ImmunoCond + Diab + NeuroCond +
+             Smoker + SubAbuse + Obese +
+             
+             #After Effects
+             Pneum +
+             
+             #Demographics
+             AgeNum + PercentSick14 + NewIndustry,
+             
+             # Industries patient work in
+
+           
+             data= InvestsComplete, family= "binomial", maxit = 100)
+
+summary(HospModel)
+
+step.HospModel <- HospModel %>% stepAIC(trace = FALSE) 
+summary(step.HospModel)
+
+# collinerity check
+## the VIF is relatively low with around 1-2 for all variable selected
+Hosp_VIF <- car::vif((step.HospModel))
+Hosp_VIF <- Hosp_VIF[which(Hosp_VIF<10)]
+
+
+### with cross validation
+Metrics2 = matrix(NA,nrow = 5, ncol = 3)
+colnames(Metrics2) <- c("Recall", "Precision", "cutoff")
+Logit_out2 <- list()
+for(i in seq_len(k)){
+
+    #code that isolates the test/train data!
+    is_test = test_folds == i
+    is_train = !is_test
+    # fitting models and counting time
+    print(paste("cross validation fold", i))
+    t0 <- Sys.time()
+    HospModel2 <- glm(as.factor(DeathDummy) ~ 
+             #Symptoms
+             #NewIndustry + 
+               GISymp +ENTSymp + RespSymp + SysSymp + 
+             
+             #Pre-Existing
+             RenalCond + CVCond + Diab + Smoker + Obese +
+              
+             #After Effects
+             Pneum + 
+                          
+             #Demographics
+             AgeNum + PercentSick14,
+  
+             data = InvestsComplete[is_train,], family = "binomial")
+    
+    
+    #print(paste('running Logit regression on hospitalization took', Sys.time() - t0))
+    # prediction metirc 
+    
+    Hmodel_coef <- coef(HospModel2)[which(summary(HospModel2)$coefficients[,4]<0.05)]
+    
+    pos <- match(names(InvestsComplete),stringr::str_remove(names(Hmodel_coef)[-1],"1"))
+    x <- InvestsComplete[,which(!is.na(pos) == TRUE)]
+    print(paste("variables used in model:",NLP::as.String(names(x))))
+    
+    
+    x <- x[is_test,]
+    Actual <- InvestsComplete[is_test,"HospDummy"]
+    Actual <- apply(Actual,2,as.numeric)
+    Y <- Hmodel_coef[1]+ apply(x,2,as.numeric) %*% Hmodel_coef[2:length(Hmodel_coef)]
+    p_hat <- exp(Y)/(1+exp(Y))
+    Logit_out2[[i]] <- p_hat
+    ## we want recall higher than 0.8 so we have 80% of the hospitalization recognized
+    
+    Rec <- c()
+    Prec <- c()
+    F1 <- c()
+    for (j in seq(1,1000,by = 1)){
+      cutoff <- 1 - 0.001*j
+      Rec[j] <- ModelMetrics::recall(Actual, p_hat, cutoff = cutoff)
+      Prec[j] <- ModelMetrics::precision(Actual, p_hat, cutoff = cutoff)
+      F1[j] <- 2*Rec[j]*Prec[j]/(Rec[j]+Prec[j])
+    }
+    ## Maximize F1 score since we care both recall and precision
+    
+    F1 <- na.fill.default(F1,0)
+    Best_prec <- max(na.omit(F1))
+    Best_score_ind <- Position(function(x) x == Best_prec, F1)
+    cutoff <- 1 - 0.001*Best_score_ind
+    Metrics2[i,1] <- Rec[Best_score_ind]
+    Metrics2[i,2] <- Prec[Best_score_ind]
+    Metrics2[i,3] <- cutoff
+
+    print(paste("Probability higher than ", round(cutoff,4), " is consider hosipitalized"))
+    print(paste("F1 :", F1[Best_score_ind]))
+    print(paste("Recall :", Rec[Best_score_ind]))
+    print(paste("Precision :", Prec[Best_score_ind]))
+
+}
+
+
+## best was from cross validation fold 1: "F1 =  0.547619047619048"
+## [1] "variables used in model: ENTSymp\nRenalCond\nCVCond\nPneum\nAgeNum"
+
+final_HospModel <- glm(as.factor(HospDummy) ~ 
+             #Symptoms
+             #NewIndustry + 
+             ENTSymp +
+             
+             #Pre-Existing
+             RenalCond + CVCond +
+              
+             #After Effects
+             Pneum + 
+                          
+             #Demographics
+             AgeNum,
+  
+             data = InvestsComplete, family = "binomial")
+summary(final_HospModel)
+
+pos <- match(names(InvestsComplete),stringr::str_remove(names(coef(final_HospModel))[-1],"1"))
+Hosp_x <- InvestsComplete[,which(!is.na(pos) == TRUE)]
+
+Actual <- InvestsComplete[,"HospDummy"]
+Actual <- apply(Actual,2,as.numeric)
+Hosp_Y <- coef(final_HospModel)[1]+ apply(Hosp_x,2,as.numeric) %*% coef(final_HospModel)[2:length(coef(final_HospModel))]
+Hosp_p_hat <- exp(Hosp_Y)/(1+exp(Hosp_Y))
+
+
+## cutoff
+    Rec <- c()
+    Prec <- c()
+    F1 <- c()
+    for (j in seq(1,1000,by = 1)){
+      cutoff <- 1 - 0.001*j
+      Rec[j] <- ModelMetrics::recall(Actual, Hosp_p_hat, cutoff = cutoff)
+      Prec[j] <- ModelMetrics::precision(Actual, Hosp_p_hat, cutoff = cutoff)
+      F1[j] <- 2*Rec[j]*Prec[j]/(Rec[j]+Prec[j])
+    }
+    ## Maximize F1 score since we care both recall and precision
+    F1 <- na.fill.default(F1,0)
+    Best_prec <- max(na.omit(F1))
+    Best_score_ind <- Position(function(x) x == Best_prec, F1)
+    cutoff <- 1 - 0.001*Best_score_ind
+
+Hmodel_metric <- c()
+Hmodel_metric["recall"] <- ModelMetrics::recall(Actual, Hosp_p_hat, cutoff = cutoff)
+Hmodel_metric["precision"] <-ModelMetrics::precision(Actual, Hosp_p_hat, cutoff = cutoff)
+Hmodel_metric["cutoff"] <- cutoff
+
+Hmodel_metric
+plot(Hosp_p_hat, main = "hospitalization regression", ylab = "Hospitalization probability")
+
+```
+
+
+```{r}
+#Predictions
+InvestsComplete$PredHosp <- predict(final_HospModel, newdata=InvestsComplete, type="response")
+InvestsComplete$PredDeath <- predict(final_DeathModel, newdata=InvestsComplete, type="response")
+
+
+
+#Way of sorting for risk
+InvestsComplete$RiskFinal <- rank((InvestsComplete$PredHosp + InvestsComplete$PredDeath)/2,
+                                  ties.method = "min")
+#Cuts for  Categories
+P14Cuts <- max(InvestsComplete$PercentSick14)/5
+
+#Generates Categories
+InvestsComplete$AreaRisk <- cut(InvestsComplete$PercentSick14, seq(min(InvestsComplete$PercentSick14),
+                                                                   max(InvestsComplete$PercentSick14)), 
+                                                   breaks= c(-Inf, P14Cuts, P14Cuts*2, P14Cuts*3, P14Cuts*4, Inf),
+                                                   labels= c("Very Low", "Low", "Medium", "High", "Very High"),
+                                                   ordered_result = TRUE)
+
+#Sort the patients on risk priority
+InvestsComplete <- InvestsComplete[order(-InvestsComplete$RiskFinal, InvestsComplete$AreaRisk), ]
+
+
+```
+
